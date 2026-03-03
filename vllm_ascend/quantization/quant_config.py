@@ -215,6 +215,11 @@ QUANT_MODEL_PREFIX_MAPPINGS = {
         "language_model.lm_head.": "lm_head.",
         "language_model.model.": "model.language_model.",
     },
+    "qwen3_5_moe": {
+        "visual.": "model.visual.",
+        "language_model.lm_head.": "lm_head.",
+        "language_model.model.": "model.language_model.",
+    },
 }
 
 packed_modules_model_mapping = {
@@ -228,6 +233,16 @@ packed_modules_model_mapping = {
             "gate_proj",
             "up_proj",
         ],
+        "experts":
+        ["experts.0.gate_proj", "experts.0.up_proj", "experts.0.down_proj"],
+    },
+    "qwen3_5_moe": {
+        "qkv_proj": [
+            "q_proj",
+            "k_proj",
+            "v_proj",
+        ],
+        "gate_up_proj": ["gate_proj", "up_proj"],
         "experts":
         ["experts.0.gate_proj", "experts.0.up_proj", "experts.0.down_proj"],
     },

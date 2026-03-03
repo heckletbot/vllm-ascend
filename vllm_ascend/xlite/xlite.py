@@ -176,6 +176,8 @@ def xlite_model_init(
         "Qwen2ForCausalLM": LlamaXliteModel,
         "Qwen3ForCausalLM": LlamaXliteModel,
         "Qwen3VLForConditionalGeneration": LlamaXliteModel,
+        "Qwen3_5ForConditionalGeneration": LlamaXliteModel,
+        "Qwen3_5MoeForConditionalGeneration": LlamaXliteModel,
     }
 
     architecture = vllm_config.model_config.architectures[0]

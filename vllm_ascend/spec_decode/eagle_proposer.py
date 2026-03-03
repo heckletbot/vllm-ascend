@@ -203,6 +203,8 @@ class EagleProposer(VllmEagleProposer):
             if self.get_model_name(model) in [
                     "Qwen2_5_VLForConditionalGeneration",
                     "Qwen3VLForConditionalGeneration",
+                    "Qwen3VLMoeForConditionalGeneration",
+                    "Qwen3_5MoeForConditionalGeneration",
             ]:
                 self.model.config.image_token_index = model.config.image_token_id
             elif self.get_model_name(
