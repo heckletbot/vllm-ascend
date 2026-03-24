@@ -52,18 +52,49 @@ class AscendQwen3Next_GatedDeltaNet(Qwen3NextGatedDeltaNet):
         # ============================================================
         # Part 1: Input Projection
         # ============================================================
-        num_k_heads_per_tp = triton.cdiv(self.num_k_heads, self.tp_size)
-        num_v_heads_per_tp = triton.cdiv(self.num_v_heads, self.tp_size)
+        can_merge_all_gather = (
+            hasattr(self.in_proj_qkvz, "gather_output")
+            and hasattr(self.in_proj_ba, "gather_output")
+            and hasattr(self.in_proj_qkvz, "custom_op")
+            and hasattr(self.in_proj_ba, "custom_op")
+            and self.in_proj_qkvz.custom_op is not None
+            and self.in_proj_ba.custom_op is not None
+            and hasattr(self.in_proj_qkvz.custom_op, "comm_group")
+            and self.in_proj_qkvz.custom_op.comm_group is not None
+            and self.in_proj_qkvz.custom_op.comm_group is self.in_proj_ba.custom_op.comm_group
+        )
 
-        # Prefer fused projection path to avoid two all_gather calls.
-        if hasattr(self, "in_proj") and self.in_proj is not None:
-            projected_states, _ = self.in_proj(hidden_states)
-            v_heads_per_qk = num_v_heads_per_tp // num_k_heads_per_tp
-            v_dim_per_qk = v_heads_per_qk * self.head_v_dim
-            qkvz_dim_t = self.head_k_dim * 2 + v_dim_per_qk * 2
-            qkvz_dim = num_k_heads_per_tp * qkvz_dim_t
-            projected_states_qkvz, projected_states_ba = projected_states.split(
-                [qkvz_dim, projected_states.shape[-1] - qkvz_dim],
+        if can_merge_all_gather:
+            qkvz_gather_output = self.in_proj_qkvz.gather_output
+            ba_gather_output = self.in_proj_ba.gather_output
+            try:
+                # Run both projections in local-shard mode, then all_gather once.
+                self.in_proj_qkvz.gather_output = False
+                self.in_proj_ba.gather_output = False
+                projected_states_qkvz_local, _ = self.in_proj_qkvz(hidden_states)
+                projected_states_ba_local, _ = self.in_proj_ba(hidden_states)
+            finally:
+                self.in_proj_qkvz.gather_output = qkvz_gather_output
+                self.in_proj_ba.gather_output = ba_gather_output
+
+            qkvz_local_dim = projected_states_qkvz_local.shape[-1]
+            local_total_dim = qkvz_local_dim + projected_states_ba_local.shape[-1]
+
+            projected_states_local = torch.cat(
+                [projected_states_qkvz_local, projected_states_ba_local],
+                dim=-1,
+            )
+            projected_states_gathered = self.in_proj_qkvz.custom_op.comm_group.all_gather(
+                projected_states_local
+            )
+
+            rank_chunks = projected_states_gathered.split(local_total_dim, dim=-1)
+            projected_states_qkvz = torch.cat(
+                [chunk[..., :qkvz_local_dim] for chunk in rank_chunks],
+                dim=-1,
+            )
+            projected_states_ba = torch.cat(
+                [chunk[..., qkvz_local_dim:] for chunk in rank_chunks],
                 dim=-1,
             )
         else:
@@ -74,8 +105,8 @@ class AscendQwen3Next_GatedDeltaNet(Qwen3NextGatedDeltaNet):
         mixed_qkv, z, b, a = fused_qkvzba_split_reshape_cat(
             projected_states_qkvz,
             projected_states_ba,
-            num_k_heads_per_tp,
-            num_v_heads_per_tp,
+            triton.cdiv(self.num_k_heads, self.tp_size),
+            triton.cdiv(self.num_v_heads, self.tp_size),
             self.head_k_dim,
             self.head_v_dim,
         )
