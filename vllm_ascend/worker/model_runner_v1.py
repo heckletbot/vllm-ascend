@@ -19,6 +19,7 @@
 
 import math
 import sys
+import time
 from collections import defaultdict
 from contextlib import contextmanager, nullcontext
 from copy import copy, deepcopy
@@ -118,6 +119,7 @@ from vllm_ascend.spec_decode.eagle_proposer import AscendEagleProposer
 from vllm_ascend.spec_decode.medusa_proposer import AscendMedusaProposer
 from vllm_ascend.spec_decode.ngram_proposer import AscendNgramProposer
 from vllm_ascend.spec_decode.suffix_proposer import AscendSuffixDecodingProposer
+from vllm_ascend.utils.pipeline_timing import is_pipeline_timing_enabled, log_pipeline_timing
 from vllm_ascend.utils import (
     calc_split_factor,
     check_gdn_layer,
@@ -1135,6 +1137,20 @@ class NPUModelRunner(GPUModelRunner):
 
         return draft_token_ids
 
+    def _execute_mm_encoder(self, scheduler_output: "SchedulerOutput"):
+        """ViT / multimodal encoder; timed when VLLM_ASCEND_PIPELINE_TIMING=1."""
+        if not is_pipeline_timing_enabled():
+            return super()._execute_mm_encoder(scheduler_output)
+        t0 = time.perf_counter()
+        out = super()._execute_mm_encoder(scheduler_output)
+        n_enc = len(scheduler_output.scheduled_encoder_inputs) if scheduler_output.scheduled_encoder_inputs else 0
+        log_pipeline_timing(
+            "worker_vit_mm_encoder",
+            (time.perf_counter() - t0) * 1000,
+            scheduled_encoder_inputs=n_enc,
+        )
+        return out
+
     @torch.inference_mode()
     def execute_model(
         self,
@@ -1161,6 +1177,7 @@ class NPUModelRunner(GPUModelRunner):
         ):
             scheduler_output = deepcopy(scheduler_output)
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+        _t_prepare_start: float | None = time.perf_counter() if is_pipeline_timing_enabled() else None
         with record_function_or_nullcontext("prepare input"):
             with self.synchronize_input_prep():
                 # Update persistent batch states.
@@ -1315,6 +1332,14 @@ class NPUModelRunner(GPUModelRunner):
                     cascade_attn_prefix_lens=cascade_attn_prefix_lens,
                 )
 
+                if _t_prepare_start is not None:
+                    log_pipeline_timing(
+                        "worker_prepare_input",
+                        (time.perf_counter() - _t_prepare_start) * 1000,
+                        num_scheduled_tokens=num_scheduled_tokens,
+                    )
+
+            _t_preprocess_start: float | None = time.perf_counter() if is_pipeline_timing_enabled() else None
             (
                 input_ids,
                 inputs_embeds,
@@ -1332,6 +1357,14 @@ class NPUModelRunner(GPUModelRunner):
 
             # update global cos, sin
             update_cos_sin(positions)
+
+            if _t_preprocess_start is not None:
+                log_pipeline_timing(
+                    "worker_preprocess_embed_merge",
+                    (time.perf_counter() - _t_preprocess_start) * 1000,
+                    num_scheduled_tokens=num_scheduled_tokens,
+                    is_multimodal=self.is_multimodal_model,
+                )
 
         if self.dynamic_eplb:
             with record_function_or_nullcontext("EPLB weight D2D"):
@@ -1387,84 +1420,100 @@ class NPUModelRunner(GPUModelRunner):
                 ),
             ) as kv_connector_output,
         ):
+            _t_forward_start: float | None = time.perf_counter() if is_pipeline_timing_enabled() else None
             hidden_states = self._model_forward(
                 num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
             )
-        with record_function_or_nullcontext("post process"):
-            aux_hidden_states = None
-            if self.use_aux_hidden_state_outputs:
-                hidden_states, aux_hidden_states = hidden_states
-            if self.pcp_size > 1:
-                # NOTE we must `slice` hidden_states because pcp_allgather_restore_idx
-                # ignores the padding from CUDA Graph.
-                hidden_states = self.pcp_manager.get_restore_hidden_states(hidden_states)
-                if aux_hidden_states is not None:
-                    aux_hidden_states = [
-                        self.pcp_manager.get_restore_hidden_states(aux_hidden_states_pcp)
-                        for aux_hidden_states_pcp in aux_hidden_states
-                    ]
+            if _t_forward_start is not None:
+                log_pipeline_timing(
+                    "worker_forward_llm",
+                    (time.perf_counter() - _t_forward_start) * 1000,
+                    num_tokens_padded=num_tokens_padded,
+                )
+        _t_post_start: float | None = time.perf_counter() if is_pipeline_timing_enabled() else None
+        try:
+            with record_function_or_nullcontext("post process"):
+                aux_hidden_states = None
+                if self.use_aux_hidden_state_outputs:
+                    hidden_states, aux_hidden_states = hidden_states
+                if self.pcp_size > 1:
+                    # NOTE we must `slice` hidden_states because pcp_allgather_restore_idx
+                    # ignores the padding from CUDA Graph.
+                    hidden_states = self.pcp_manager.get_restore_hidden_states(hidden_states)
+                    if aux_hidden_states is not None:
+                        aux_hidden_states = [
+                            self.pcp_manager.get_restore_hidden_states(aux_hidden_states_pcp)
+                            for aux_hidden_states_pcp in aux_hidden_states
+                        ]
 
-            if not self.broadcast_pp_output:
-                # Common case.
-                if not get_pp_group().is_last_rank:
-                    # Return the intermediate tensors.
-                    assert isinstance(hidden_states, IntermediateTensors)
-                    hidden_states.kv_connector_output = kv_connector_output
-                    self.kv_connector_output = kv_connector_output
-                    if self.debugger is not None:
-                        self.debugger.stop()
-                        self.debugger.step()
-                    return hidden_states
-                if self.is_pooling_model:
-                    # Return the pooling output.
-                    output = self._pool(
-                        hidden_states, num_scheduled_tokens, num_scheduled_tokens_np, kv_connector_output
-                    )
-                    output.kv_connector_output = kv_connector_output
-                    if self.debugger is not None:
-                        self.debugger.stop()
-                        self.debugger.step()
-                    return output
+                if not self.broadcast_pp_output:
+                    # Common case.
+                    if not get_pp_group().is_last_rank:
+                        # Return the intermediate tensors.
+                        assert isinstance(hidden_states, IntermediateTensors)
+                        hidden_states.kv_connector_output = kv_connector_output
+                        self.kv_connector_output = kv_connector_output
+                        if self.debugger is not None:
+                            self.debugger.stop()
+                            self.debugger.step()
+                        return hidden_states
+                    if self.is_pooling_model:
+                        # Return the pooling output.
+                        output = self._pool(
+                            hidden_states, num_scheduled_tokens, num_scheduled_tokens_np, kv_connector_output
+                        )
+                        output.kv_connector_output = kv_connector_output
+                        if self.debugger is not None:
+                            self.debugger.stop()
+                            self.debugger.step()
+                        return output
 
-                sample_hidden_states = hidden_states[logits_indices]
-                logits = self.model.compute_logits(sample_hidden_states)
-            else:
-                # Rare case.
-                assert not self.is_pooling_model
-
-                if not get_pp_group().is_last_rank:
-                    sample_hidden_states = hidden_states[logits_indices]
-                    get_pp_group().send_tensor_dict(hidden_states.tensors, all_gather_group=get_tp_group())
-                    logits = None
-                else:
                     sample_hidden_states = hidden_states[logits_indices]
                     logits = self.model.compute_logits(sample_hidden_states)
+                else:
+                    # Rare case.
+                    assert not self.is_pooling_model
 
-                model_output_broadcast_data: dict[str, Any] = {}
-                if logits is not None:
-                    model_output_broadcast_data["logits"] = logits.contiguous()
-                broadcasted = get_pp_group().broadcast_tensor_dict(
-                    model_output_broadcast_data, src=len(get_pp_group().ranks) - 1
+                    if not get_pp_group().is_last_rank:
+                        sample_hidden_states = hidden_states[logits_indices]
+                        get_pp_group().send_tensor_dict(hidden_states.tensors, all_gather_group=get_tp_group())
+                        logits = None
+                    else:
+                        sample_hidden_states = hidden_states[logits_indices]
+                        logits = self.model.compute_logits(sample_hidden_states)
+
+                    model_output_broadcast_data: dict[str, Any] = {}
+                    if logits is not None:
+                        model_output_broadcast_data["logits"] = logits.contiguous()
+                    broadcasted = get_pp_group().broadcast_tensor_dict(
+                        model_output_broadcast_data, src=len(get_pp_group().ranks) - 1
+                    )
+                    assert broadcasted is not None
+                    logits = broadcasted["logits"]
+
+                # Apply structured output bitmasks if present
+                self.execute_model_state = ExecuteModelState(
+                    scheduler_output,
+                    logits,
+                    spec_decode_metadata,
+                    spec_decode_common_attn_metadata,
+                    hidden_states,
+                    sample_hidden_states,
+                    aux_hidden_states,
+                    attn_metadata,
+                    positions,
+                    ec_connector_output,
+                    cudagraph_stats,
+                    batch_desc,
                 )
-                assert broadcasted is not None
-                logits = broadcasted["logits"]
-
-            # Apply structured output bitmasks if present
-            self.execute_model_state = ExecuteModelState(
-                scheduler_output,
-                logits,
-                spec_decode_metadata,
-                spec_decode_common_attn_metadata,
-                hidden_states,
-                sample_hidden_states,
-                aux_hidden_states,
-                attn_metadata,
-                positions,
-                ec_connector_output,
-                cudagraph_stats,
-                batch_desc,
-            )
-            self.kv_connector_output = kv_connector_output
+                self.kv_connector_output = kv_connector_output
+        finally:
+            if _t_post_start is not None:
+                log_pipeline_timing(
+                    "worker_post_logits_execute_state",
+                    (time.perf_counter() - _t_post_start) * 1000,
+                    num_scheduled_tokens=num_scheduled_tokens,
+                )
         return None
 
     @torch.inference_mode()
@@ -1512,15 +1561,29 @@ class NPUModelRunner(GPUModelRunner):
 
         # Apply structured output bitmasks if present.
         if grammar_output is not None:
+            _t_grammar = time.perf_counter() if is_pipeline_timing_enabled() else None
             # here we are different from gpu_model_runner,
             # the apply_grammar_bitmask uses torch.compile to optimize this,ascend does not support it now
             logits_dtype = logits.dtype
             logits = logits.to("cpu").float()
             apply_grammar_bitmask(scheduler_output, grammar_output, self.input_batch, logits)
             logits = logits.to(self.device).to(logits_dtype)
+            if _t_grammar is not None:
+                log_pipeline_timing(
+                    "worker_grammar_bitmask",
+                    (time.perf_counter() - _t_grammar) * 1000,
+                    num_scheduled_tokens=scheduler_output.total_num_scheduled_tokens,
+                )
 
         with record_function_or_nullcontext("sample_token"):
+            _t_sample = time.perf_counter() if is_pipeline_timing_enabled() else None
             sampler_output = self._sample(logits, spec_decode_metadata)
+            if _t_sample is not None:
+                log_pipeline_timing(
+                    "worker_sampler",
+                    (time.perf_counter() - _t_sample) * 1000,
+                    num_scheduled_tokens=scheduler_output.total_num_scheduled_tokens,
+                )
 
         if self.need_accepted_tokens:
             if self.sampling_done_event is None:
@@ -1546,6 +1609,7 @@ class NPUModelRunner(GPUModelRunner):
             )
             self._copy_draft_token_ids_to_cpu(scheduler_output)
 
+        _t_bookkeeping = time.perf_counter() if is_pipeline_timing_enabled() else None
         (
             logprobs_lists,
             valid_sampled_token_ids,
@@ -1561,8 +1625,15 @@ class NPUModelRunner(GPUModelRunner):
             scheduler_output.total_num_scheduled_tokens,
             spec_decode_metadata,
         )
+        if _t_bookkeeping is not None:
+            log_pipeline_timing(
+                "worker_bookkeeping_sync",
+                (time.perf_counter() - _t_bookkeeping) * 1000,
+                num_scheduled_tokens=scheduler_output.total_num_scheduled_tokens,
+            )
 
         with record_function_or_nullcontext("draft_token"):
+            _t_draft = time.perf_counter() if is_pipeline_timing_enabled() else None
             if self.speculative_config:
                 use_padded_batch = (
                     self.speculative_config
@@ -1580,6 +1651,13 @@ class NPUModelRunner(GPUModelRunner):
 
             if has_kv_transfer_group():
                 get_kv_transfer_group().clear_connector_metadata()
+
+            if _t_draft is not None:
+                log_pipeline_timing(
+                    "worker_draft_spec_decode",
+                    (time.perf_counter() - _t_draft) * 1000,
+                    has_speculative=self.speculative_config is not None,
+                )
 
         if self.model_config.enable_return_routed_experts:
             capturer = RoutedExpertsCapturer.get_instance()

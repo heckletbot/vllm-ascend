@@ -866,6 +866,10 @@ class NPUPlatform(Platform):
                 )
                 att_config.flash_attn_max_num_splits_for_cuda_graph = 32
 
+        from vllm_ascend.utils.engine_pipeline_timing_patch import apply_engine_pipeline_timing_patch
+
+        apply_engine_pipeline_timing_patch()
+
     @classmethod
     def use_custom_op_collectives(cls) -> bool:
         return True
