@@ -79,6 +79,19 @@ if TYPE_CHECKING:
 DONE_SENDING_MSG = b"done_sending_msg"
 
 
+def _spec_method_uses_mtp_kv_register_addr_adjustment(method: str | None) -> bool:
+    """Only MTP-style speculation uses the hybrid MTP base-address correction.
+
+    Models may contain an ``mtp`` layer name while using Eagle; subtracting
+    ``conv_total_padding_size`` is then incorrect and breaks 2MB registration alignment.
+    """
+    if not method:
+        return False
+    if method == "mtp":
+        return True
+    return method.endswith("_mtp")
+
+
 @dataclass
 class LayerMetadata:
     tensor_group_idx: list[int]
@@ -281,7 +294,18 @@ class KVCacheSendingLayerThread(threading.Thread):
         if isinstance(layer_kv_cache_spec, MambaSpec):
             # only support one block transfer for mamba
             if self.mamba_cache_mode == "align":
-                transfer_block_idx = len(local_block_ids) - self.num_speculative_tokens - 1
+                num_local_blocks = len(local_block_ids)
+                spec_cfg = self.vllm_config.speculative_config
+                # Eagle / Eagle3: prefill P-side block tables do not reserve MTP-style
+                # trailing speculative slots; subtracting num_speculative_tokens is wrong.
+                if spec_cfg is not None and spec_cfg.method in (
+                    "eagle",
+                    "eagle3",
+                    "extract_hidden_states",
+                ):
+                    transfer_block_idx = max(0, num_local_blocks - 1)
+                else:
+                    transfer_block_idx = max(0, num_local_blocks - self.num_speculative_tokens - 1)
             else:
                 transfer_block_idx = 0
             local_conv_addr, local_ssm_addr = local_layer_metadata.kv_caches_base_addr
@@ -1124,6 +1148,10 @@ class MooncakeLayerwiseConnectorWorker:
                 use_attn_mamba_hybrid = True
                 break
 
+        spec_cfg = getattr(self.vllm_config, "speculative_config", None)
+        spec_method = getattr(spec_cfg, "method", None) if spec_cfg else None
+        use_mtp_kv_addr_adjust = _spec_method_uses_mtp_kv_register_addr_adjustment(spec_method)
+
         ptrs = []
         lengths = []
         use_kv_buffer = False
@@ -1170,7 +1198,7 @@ class MooncakeLayerwiseConnectorWorker:
                 tensor_addrs = []
                 for layer_name in kv_cache_tensor.shared_by:
                     tensor_addrs.extend(self.layer_metadata[layer_name].kv_caches_base_addr)
-                    if "mtp" in layer_name:
+                    if "mtp" in layer_name and use_mtp_kv_addr_adjust:
                         tensor_addrs.append(min(tensor_addrs) - conv_total_padding_size)
                 assert min(set(tensor_addrs)) % (2 * 1024 * 1024) == 0, "Tensor start addr is not align with 2M."
                 ptrs.append(min(set(tensor_addrs)))
