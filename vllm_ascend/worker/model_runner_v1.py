@@ -19,6 +19,7 @@
 
 import math
 import sys
+import time
 from collections import defaultdict
 from contextlib import contextmanager, nullcontext
 from copy import copy, deepcopy
@@ -1135,6 +1136,15 @@ class NPUModelRunner(GPUModelRunner):
 
         return draft_token_ids
 
+    def _execute_mm_encoder(self, scheduler_output: "SchedulerOutput"):
+        _t_vit0 = time.perf_counter()
+        out = super()._execute_mm_encoder(scheduler_output)
+        print(
+            f"[qwen35_timing] vit_encoder_ms={(time.perf_counter() - _t_vit0) * 1000:.3f}",
+            flush=True,
+        )
+        return out
+
     @torch.inference_mode()
     def execute_model(
         self,
@@ -1161,6 +1171,7 @@ class NPUModelRunner(GPUModelRunner):
         ):
             scheduler_output = deepcopy(scheduler_output)
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+        _t_pre = time.perf_counter()
         with record_function_or_nullcontext("prepare input"):
             with self.synchronize_input_prep():
                 # Update persistent batch states.
@@ -1333,6 +1344,12 @@ class NPUModelRunner(GPUModelRunner):
             # update global cos, sin
             update_cos_sin(positions)
 
+        print(
+            f"[qwen35_timing] preproc_ms={(time.perf_counter() - _t_pre) * 1000:.3f} "
+            f"num_scheduled_tokens={num_scheduled_tokens}",
+            flush=True,
+        )
+
         if self.dynamic_eplb:
             with record_function_or_nullcontext("EPLB weight D2D"):
                 self.eplb_updator.forward_before()
@@ -1387,9 +1404,16 @@ class NPUModelRunner(GPUModelRunner):
                 ),
             ) as kv_connector_output,
         ):
+            _t_fw = time.perf_counter()
             hidden_states = self._model_forward(
                 num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
             )
+            print(
+                f"[qwen35_timing] forward_llm_ms={(time.perf_counter() - _t_fw) * 1000:.3f} "
+                f"num_tokens_padded={num_tokens_padded}",
+                flush=True,
+            )
+        _t_post_logits = time.perf_counter()
         with record_function_or_nullcontext("post process"):
             aux_hidden_states = None
             if self.use_aux_hidden_state_outputs:
@@ -1465,6 +1489,11 @@ class NPUModelRunner(GPUModelRunner):
                 batch_desc,
             )
             self.kv_connector_output = kv_connector_output
+        print(
+            f"[qwen35_timing] post_logits_ms={(time.perf_counter() - _t_post_logits) * 1000:.3f} "
+            f"num_scheduled_tokens={num_scheduled_tokens}",
+            flush=True,
+        )
         return None
 
     @torch.inference_mode()
@@ -1510,6 +1539,8 @@ class NPUModelRunner(GPUModelRunner):
         # Clear ephemeral state.
         self.execute_model_state = None
 
+        _t_sampler = time.perf_counter()
+
         # Apply structured output bitmasks if present.
         if grammar_output is not None:
             # here we are different from gpu_model_runner,
@@ -1521,6 +1552,12 @@ class NPUModelRunner(GPUModelRunner):
 
         with record_function_or_nullcontext("sample_token"):
             sampler_output = self._sample(logits, spec_decode_metadata)
+
+        print(
+            f"[qwen35_timing] sampler_ms={(time.perf_counter() - _t_sampler) * 1000:.3f} "
+            f"(grammar+sample) num_scheduled_tokens={scheduler_output.total_num_scheduled_tokens}",
+            flush=True,
+        )
 
         if self.need_accepted_tokens:
             if self.sampling_done_event is None:
@@ -1546,6 +1583,7 @@ class NPUModelRunner(GPUModelRunner):
             )
             self._copy_draft_token_ids_to_cpu(scheduler_output)
 
+        _t_post_sample = time.perf_counter()
         (
             logprobs_lists,
             valid_sampled_token_ids,
@@ -1580,6 +1618,12 @@ class NPUModelRunner(GPUModelRunner):
 
             if has_kv_transfer_group():
                 get_kv_transfer_group().clear_connector_metadata()
+
+        print(
+            f"[qwen35_timing] post_sample_worker_ms={(time.perf_counter() - _t_post_sample) * 1000:.3f} "
+            f"(bookkeeping+draft)",
+            flush=True,
+        )
 
         if self.model_config.enable_return_routed_experts:
             capturer = RoutedExpertsCapturer.get_instance()
