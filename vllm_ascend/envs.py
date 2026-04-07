@@ -107,8 +107,6 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_FUSION_OP_TRANSPOSE_KV_CACHE_BY_BLOCK": lambda: bool(
         int(os.getenv("VLLM_ASCEND_FUSION_OP_TRANSPOSE_KV_CACHE_BY_BLOCK", "1"))
     ),
-    # Log multimodal + LLM pipeline stage latency (engine step + worker); see pipeline_timing.py.
-    "VLLM_ASCEND_PIPELINE_TIMING": lambda: bool(int(os.getenv("VLLM_ASCEND_PIPELINE_TIMING", "0"))),
 }
 
 # end-env-vars-definition
